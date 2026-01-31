@@ -30,7 +30,6 @@ public class GrocyService {
   private final RestTemplate restTemplate = new RestTemplate();
   private final ObjectMapper jsonMapper = new ObjectMapper();
 
-  // --- 1. Header bauen (Der Schlüssel zur Grocy API) ---
   private HttpHeaders getHeaders() {
     HttpHeaders headers = new HttpHeaders();
     headers.set("GROCY-API-KEY", grocyApiKey);
@@ -38,12 +37,12 @@ public class GrocyService {
     return headers;
   }
 
-  // --- 2. Alle Produkte laden (für das Dropdown) ---
+  // Fetch all products
   public List<GrocyProduct> getProducts() {
     try {
       HttpEntity<String> entity = new HttpEntity<>(getHeaders());
 
-      // Aufruf an Grocy: /objects/products
+      // Call Grocy: /objects/products
       ResponseEntity<String> response = restTemplate.exchange(
               grocyUrl + "/objects/products",
               HttpMethod.GET,
@@ -51,22 +50,21 @@ public class GrocyService {
               String.class
       );
 
-      // JSON String in Liste umwandeln
       return jsonMapper.readValue(response.getBody(), new TypeReference<List<GrocyProduct>>() {});
     } catch (Exception e) {
-      System.err.println("Fehler beim Laden der Produkte: " + e.getMessage());
+      System.err.println("Error loading products: " + e.getMessage());
       return Collections.emptyList();
     }
   }
 
-  // --- 3. Laden-ID finden (z.B. "LIDL" -> ID 5) ---
+  // Find store ID by name
   public String findStoreId(String shopName) {
     if (shopName == null || shopName.isEmpty()) return null;
 
     try {
       HttpEntity<String> entity = new HttpEntity<>(getHeaders());
 
-      // Aufruf an Grocy: /objects/shopping_locations
+      // Call Grocy: /objects/shopping_locations
       ResponseEntity<String> response = restTemplate.exchange(
               grocyUrl + "/objects/shopping_locations",
               HttpMethod.GET,
@@ -76,7 +74,7 @@ public class GrocyService {
 
       List<GrocyStore> stores = jsonMapper.readValue(response.getBody(), new TypeReference<List<GrocyStore>>() {});
 
-      // Suchen, ob der Name dabei ist (Groß/Klein egal)
+      // Check if name matches (case insensitive)
       return stores.stream()
               .filter(s -> s.name().equalsIgnoreCase(shopName))
               .findFirst()
@@ -84,22 +82,21 @@ public class GrocyService {
               .orElse(null);
 
     } catch (Exception e) {
-      System.err.println("Konnte Laden-ID nicht finden: " + e.getMessage());
+      System.err.println("Could not find store ID: " + e.getMessage());
       return null;
     }
   }
 
-  // --- 4. Buchen (Bestand hinzufügen) ---
+  // Add product to stock
   public void addProductToStock(String grocyId, double amount, double price, String shopName) {
     try {
-      // Erst die Laden-ID suchen
       String storeId = findStoreId(shopName);
 
-      // Payload für Grocy bauen
+      // Build payload for Grocy
       Map<String, Object> payload = new HashMap<>();
       payload.put("amount", amount);
       payload.put("price", price);
-      payload.put("best_before_date", LocalDate.now().plusDays(7).toString()); // Haltbarkeit: Standard +7 Tage
+      payload.put("best_before_date", LocalDate.now().plusDays(7).toString()); // Default: +7 days
       payload.put("transaction_type", "purchase");
 
       if (storeId != null) {
@@ -108,16 +105,15 @@ public class GrocyService {
 
       HttpEntity<Map<String, Object>> entity = new HttpEntity<>(payload, getHeaders());
 
-      // POST an /stock/products/{id}/add
       String url = grocyUrl + "/stock/products/" + grocyId + "/add";
 
       restTemplate.postForObject(url, entity, String.class);
 
-      System.out.println("✅ Gebucht: Produkt " + grocyId + " (" + amount + "x) bei " + shopName);
+      System.out.println("✅ Booked: Product " + grocyId + " (" + amount + "x) at " + shopName);
 
     } catch (Exception e) {
-      System.err.println("❌ Fehler beim Buchen: " + e.getMessage());
-      e.printStackTrace(); // Wichtig, damit wir den Fehler sehen
+      System.err.println("❌ Error booking: " + e.getMessage());
+      e.printStackTrace();
     }
   }
 }
