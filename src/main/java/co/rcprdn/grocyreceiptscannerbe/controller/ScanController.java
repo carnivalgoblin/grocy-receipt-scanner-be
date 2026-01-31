@@ -23,18 +23,15 @@ public class ScanController {
     this.grocyService = grocyService;
   }
 
-  // --- DIESER ENDPUNKT HAT GEFEHLT! ---
   @GetMapping("/products")
   public ResponseEntity<List<GrocyProduct>> getProducts() {
     try {
-      // Holt die Produkte frisch aus Grocy (über unseren neuen Service)
       return ResponseEntity.ok(grocyService.getProducts());
     } catch (Exception e) {
       e.printStackTrace();
       return ResponseEntity.internalServerError().build();
     }
   }
-  // ------------------------------------
 
   @PostMapping(value = "/upload", consumes = "multipart/form-data")
   public ResponseEntity<ScanResult> upload(@RequestParam("file") MultipartFile file) {
@@ -50,7 +47,7 @@ public class ScanController {
   @PostMapping("/book")
   public ResponseEntity<String> bookItems(@RequestBody BookingRequest request) {
     try {
-      System.out.println("--- Starte Buchung bei: " + request.shop + " ---");
+      System.out.println("--- Starting booking for: " + request.shop + " ---");
 
       for (ScannedItem item : request.items) {
         if (item.grocyId() != null && !item.grocyId().isEmpty() && !item.grocyId().equals("ignore")) {
@@ -65,10 +62,10 @@ public class ScanController {
           scanService.learnAndSave(item.ocrName(), item.grocyId());
         }
       }
-      return ResponseEntity.ok("Erfolgreich gebucht");
+      return ResponseEntity.ok("Successfully booked");
     } catch (Exception e) {
       e.printStackTrace();
-      return ResponseEntity.internalServerError().body("Fehler: " + e.getMessage());
+      return ResponseEntity.internalServerError().body("Error: " + e.getMessage());
     }
   }
 

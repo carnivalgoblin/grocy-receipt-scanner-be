@@ -3,6 +3,7 @@ package co.rcprdn.grocyreceiptscannerbe.service;
 import co.rcprdn.grocyreceiptscannerbe.dto.GrocyProduct;
 import co.rcprdn.grocyreceiptscannerbe.dto.ScanResult;
 import co.rcprdn.grocyreceiptscannerbe.dto.ScannedItem;
+import lombok.extern.slf4j.Slf4j;
 import net.sourceforge.tess4j.Tesseract;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -10,12 +11,12 @@ import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.File;
-import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+@Slf4j
 @Service
 public class ScanService {
 
@@ -23,32 +24,27 @@ public class ScanService {
   private static final String MAPPING_FILE = "mappings.json";
   private Map<String, String> knownMappings = new HashMap<>();
 
-  // --- REGEX SAMMLUNG ---
+  // --- REGEX COLLECTION ---
 
-  // 1. STANDARD (Für unbekannte Läden): "2 x Cola 1,99 A" oder "Cola 1,99"
   private static final Pattern GENERIC_ITEM_PATTERN = Pattern.compile("(.*?)\\s+(-?\\d+[,.]\\d{2})\\s*[AB]?\\s*$");
   private static final Pattern GENERIC_AMOUNT_START = Pattern.compile("^(\\d+)\\s*(?:x|X|\\*|Stk)\\s+(.*)");
 
-  // 2. LIDL SPEZIAL: "Erbsen ... 0,89 x 2   1,78 A"
-  // Erkennt Zeilen, die auf eine Summe enden, aber davor "Preis x Menge" haben
-  // Gruppe 1: Name (Alles davor)
-  // Gruppe 2: Einzelpreis (ignoriert)
-  // Gruppe 3: Menge
-  // Gruppe 4: Gesamtpreis (am Ende)
   private static final Pattern LIDL_ITEM_PATTERN = Pattern.compile("(.*?)\\s+(\\d+[,.]\\d{2})\\s*[xX*]\\s*(\\d+)\\s+(-?\\d+[,.]\\d{2})\\s*[AB]?\\s*$");
 
-  // LIDL FALLBACK (Wenn keine Menge da ist): "Milch 1,09 A"
-  private static final Pattern LIDL_SIMPLE_PATTERN = Pattern.compile("(.*?)\\s+(-?\\d+[,.]\\d{2})\\s*[AB]?\\s*$");
+  private static final Pattern REWE_ONLY_QUANTITY_LINE = Pattern.compile("^(\\d+)\\s*Stk\\s*[xX]?\\s*(\\d+[,.]\\d{2})");
+  private static final Pattern REWE_X01_PATTERN = Pattern.compile("(.*?)\\s*X01\\s*(-?\\d+[,.]\\d{2})");
 
 
-  // --- IGNORE LISTE (Gilt für alle) ---
+  // --- IGNORE LIST ---
+  // REMOVED "%" because it kills products like "Gouda 48%"
   private static final List<String> IGNORE_LIST = List.of(
           "Summe", "MWST", "Netto", "Brutto", "Betrag", "EUR", "Total", "Ergebnis",
-          "Visa", "Karte", "Kreditkarte", "zu zahlen", "Preisvorteil", "%", "Pfand",
-          "Leergut", "B 19", "A 7", "Datum", "Uhrzeit", "Bon", "Filiale", "Händler", "Beleg"
+          "Visa", "Karte", "Kreditkarte", "zu zahlen", "Preisvorteil", "Pfand",
+          "Leergut", "B 19", "A 7", "Datum", "Uhrzeit", "Bon", "Filiale", "Händler", "Beleg",
+          "Gesamtbetrag", "Geg.", "Mastercard", "Kundenbeleg", "Trace-Nr", "Terminal-ID", "UID Nr",
+          "Konzessionär", "Steuer"
   );
 
-  // Kleines Enum für die Läden
   private enum ShopType {
     LIDL, REWE, ALDI, UNKNOWN
   }
@@ -69,21 +65,22 @@ public class ScanService {
       file.transferTo(tempFile);
 
       Tesseract tesseract = new Tesseract();
-      String tessPath = getTessDataPath(); // Code ausgelagert in Hilfsmethode unten
+      String tessPath = getTessDataPath();
 
-      System.out.println("Benutze Tesseract Pfad: " + tessPath);
+      System.out.println("Using Tesseract path: " + tessPath);
       tesseract.setDatapath(tessPath);
       tesseract.setLanguage("deu");
 
-      System.out.println("--- STARTE OCR ---");
+      System.out.println("--- START OCR ---");
       String text = tesseract.doOCR(tempFile);
-      System.out.println("--- OCR FERTIG ---");
+      log.debug(text);
+      System.out.println("--- OCR FINISHED ---");
 
       return parseText(text, allProducts);
 
     } catch (Exception e) {
       e.printStackTrace();
-      return new ScanResult("", List.of());
+      return new ScanResult("Error", Collections.emptyList());
     } finally {
       if (tempFile != null && tempFile.exists()) tempFile.delete();
     }
@@ -91,74 +88,97 @@ public class ScanService {
 
   private ScanResult parseText(String text, List<GrocyProduct> grocyProducts) {
     List<ScannedItem> items = new ArrayList<>();
-
-    // 1. Ladenerkennung
     ShopType shopType = detectShop(text);
-    System.out.println("Erkannter Laden: " + shopType);
+    System.out.println("Detected Shop: " + shopType);
 
     String[] lines = text.split("\n");
+    ParsedLine pendingItem = null;
 
     for (String line : lines) {
       line = line.trim();
       if (line.isEmpty()) continue;
 
-      // Hier entscheiden wir je nach Laden, wie wir parsen
-      ParsedLine parsed = null;
+      // 1. REWE Modifier Check
+      if (shopType == ShopType.REWE && pendingItem != null) {
+        Matcher qtyMatcher = REWE_ONLY_QUANTITY_LINE.matcher(line);
+        if (qtyMatcher.find()) {
+          int amount = Integer.parseInt(qtyMatcher.group(1));
+          BigDecimal unitPrice = new BigDecimal(qtyMatcher.group(2).replace(",", "."));
 
+          System.out.println("   -> Found Modifier for '" + pendingItem.name + "': Amount " + amount + ", Price " + unitPrice);
+          pendingItem = new ParsedLine(pendingItem.name, unitPrice, amount);
+
+          addItemIfValid(pendingItem, items, grocyProducts);
+          pendingItem = null;
+          continue;
+        }
+      }
+
+      // 2. Commit Pending Item
+      if (pendingItem != null) {
+        addItemIfValid(pendingItem, items, grocyProducts);
+        pendingItem = null;
+      }
+
+      // 3. Parse New Line
+      ParsedLine parsed = null;
       if (shopType == ShopType.LIDL) {
         parsed = parseLineLidl(line);
+      } else if (shopType == ShopType.REWE) {
+        parsed = parseLineRewe(line);
       } else {
-        // Fallback für alle anderen (oder unbekannt)
         parsed = parseLineGeneric(line);
       }
 
-      // Wenn wir nichts Sinnvolles gefunden haben -> nächste Zeile
-      if (parsed == null) continue;
-
-      // Globale Filter (Müll entfernen)
-      if (isJunk(parsed.name)) continue;
-
-      // Match & Add
-      items.add(matchProduct(parsed.name, parsed.price, parsed.amount, grocyProducts));
+      // 4. Handle Result
+      if (parsed != null) {
+        if (shopType == ShopType.REWE) {
+          pendingItem = parsed;
+        } else {
+          addItemIfValid(parsed, items, grocyProducts);
+        }
+      }
     }
+
+    if (pendingItem != null) {
+      addItemIfValid(pendingItem, items, grocyProducts);
+    }
+
     return new ScanResult(shopType.name(), items);
   }
 
-  // --- PARSING LOGIK JE NACH LADEN ---
+  // New helper to avoid duplicate code and log rejected items
+  private void addItemIfValid(ParsedLine parsed, List<ScannedItem> items, List<GrocyProduct> products) {
+    if (!isJunk(parsed.name)) {
+      items.add(matchProduct(parsed.name, parsed.price, parsed.amount, products));
+    } else {
+      System.out.println("Ignored Junk: " + parsed.name);
+    }
+  }
 
   private ParsedLine parseLineLidl(String line) {
-    // Versuch 1: Lidl Spezial ("Brot 0,89 x 2  1,78 A")
     Matcher m = LIDL_ITEM_PATTERN.matcher(line);
     if (m.find()) {
-      String name = m.group(1).trim();
-
-      // ÄNDERUNG: Wir nehmen jetzt Gruppe 2 (Einzelpreis: 0,89)
-      // statt Gruppe 4 (Gesamtpreis: 1,78)
-      String unitPriceStr = m.group(2).replace(",", ".");
-
-      int amount = Integer.parseInt(m.group(3));
-
-      return new ParsedLine(name, new BigDecimal(unitPriceStr), amount);
+      return new ParsedLine(m.group(1).trim(), new BigDecimal(m.group(2).replace(",", ".")), Integer.parseInt(m.group(3)));
     }
+    return parseLineGeneric(line);
+  }
 
-    // Versuch 2: Einfache Zeile ("Milch 1,09 A") -> Hier ist Einzelpreis = Gesamtpreis
-    m = LIDL_SIMPLE_PATTERN.matcher(line);
+  private ParsedLine parseLineRewe(String line) {
+    Matcher m = REWE_X01_PATTERN.matcher(line);
     if (m.find()) {
       String name = m.group(1).trim();
-      String priceStr = m.group(2).replace(",", ".");
-      return new ParsedLine(name, new BigDecimal(priceStr), 1);
+      BigDecimal price = new BigDecimal(m.group(2).replace(",", "."));
+      return new ParsedLine(name, price, 1);
     }
-
-    return null;
+    return parseLineGeneric(line);
   }
 
   private ParsedLine parseLineGeneric(String line) {
     Matcher m = GENERIC_ITEM_PATTERN.matcher(line);
     if (m.find()) {
       String rawName = m.group(1).trim();
-      String priceStr = m.group(2).replace(",", ".");
-
-      // Menge am Anfang suchen ("2 x Cola")
+      BigDecimal price = new BigDecimal(m.group(2).replace(",", "."));
       int amount = 1;
       String finalName = rawName;
 
@@ -169,12 +189,10 @@ public class ScanService {
           finalName = amountM.group(2).trim();
         } catch (Exception e) {}
       }
-      return new ParsedLine(finalName, new BigDecimal(priceStr), amount);
+      return new ParsedLine(finalName, price, amount);
     }
     return null;
   }
-
-  // --- HILFSMETHODEN ---
 
   private ShopType detectShop(String text) {
     String upper = text.toUpperCase();
@@ -185,14 +203,14 @@ public class ScanService {
   }
 
   private boolean isJunk(String name) {
-    if (name.length() < 2) return true;
+    if (name == null || name.length() < 2) return true;
     long letterCount = name.chars().filter(Character::isLetter).count();
     long digitCount = name.chars().filter(Character::isDigit).count();
-    if (digitCount > letterCount) return true; // Mehr Zahlen als Buchstaben
+    if (digitCount > letterCount) return true;
+
     return IGNORE_LIST.stream().anyMatch(name::contains);
   }
 
-  // Kleines Hilfsobjekt um Rückgabewerte zu bündeln
   private record ParsedLine(String name, BigDecimal price, int amount) {}
 
   private String getTessDataPath() {
@@ -200,29 +218,22 @@ public class ScanService {
     if (tessPath == null || tessPath.isEmpty()) {
       File projectTess = new File("tessdata");
       File windowsTess = new File("C:\\Program Files\\Tesseract-OCR\\tessdata");
-
-      if (projectTess.exists() && new File(projectTess, "deu.traineddata").exists()) {
-        return projectTess.getAbsolutePath();
-      } else if (windowsTess.exists()) {
-        return windowsTess.getAbsolutePath();
-      } else {
-        return "/usr/share/tesseract-ocr/tessdata";
-      }
+      if (projectTess.exists() && new File(projectTess, "deu.traineddata").exists()) return projectTess.getAbsolutePath();
+      else if (windowsTess.exists()) return windowsTess.getAbsolutePath();
+      else return "/usr/share/tesseract-ocr/tessdata";
     }
     return tessPath;
   }
 
   private ScannedItem matchProduct(String ocrName, BigDecimal price, int amount, List<GrocyProduct> products) {
-    // 1. Gedächtnis
     if (knownMappings.containsKey(ocrName)) {
       String knownId = knownMappings.get(ocrName);
       String grocyName = products.stream()
               .filter(p -> p.id().equals(knownId))
               .findFirst().map(GrocyProduct::name).orElse("ID: " + knownId);
-      return new ScannedItem(ocrName, knownId, grocyName, BigDecimal.valueOf(amount), price, "Gelernt");
+      return new ScannedItem(ocrName, knownId, grocyName, BigDecimal.valueOf(amount), price, "Learned");
     }
 
-    // 2. Fuzzy Suche
     GrocyProduct bestMatch = null;
     int lowestDistance = Integer.MAX_VALUE;
     String searchName = ocrName.toLowerCase();
@@ -243,13 +254,13 @@ public class ScanService {
       return new ScannedItem(ocrName, bestMatch.id(), bestMatch.name(), BigDecimal.valueOf(amount), price, "Auto (" + lowestDistance + ")");
     }
 
-    return new ScannedItem(ocrName, "", "", BigDecimal.valueOf(amount), price, "Neu");
+    return new ScannedItem(ocrName, "", "", BigDecimal.valueOf(amount), price, "New");
   }
 
   public void learnAndSave(String ocrName, String grocyId) {
     if (ocrName == null || grocyId == null) return;
     if (!grocyId.isEmpty() && !grocyId.equals("ignore")) {
-      System.out.println("Lerne: " + ocrName + " -> " + grocyId);
+      System.out.println("Learning: " + ocrName + " -> " + grocyId);
       knownMappings.put(ocrName, grocyId);
       saveMappingsToFile();
     }
@@ -258,12 +269,20 @@ public class ScanService {
   private void loadMappings() {
     File f = new File(MAPPING_FILE);
     if (f.exists()) {
-      knownMappings = jsonMapper.readValue(f, new TypeReference<HashMap<String, String>>() {});
+      try {
+        knownMappings = jsonMapper.readValue(f, new TypeReference<HashMap<String, String>>() {});
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
     }
   }
 
   private void saveMappingsToFile() {
-    jsonMapper.writeValue(new File(MAPPING_FILE), knownMappings);
+    try {
+      jsonMapper.writeValue(new File(MAPPING_FILE), knownMappings);
+    } catch (Exception e) {
+      System.err.println("Could not save mappings: " + e.getMessage());
+    }
   }
 
   private int calculateLevenshteinDistance(String x, String y) {
