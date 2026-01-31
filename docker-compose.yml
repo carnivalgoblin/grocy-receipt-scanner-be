@@ -1,0 +1,30 @@
+services:
+  # --- BACKEND SERVICE ---
+  backend:
+    build: ./grocy-receipt-scanner-be
+    container_name: scanner-backend
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      # CONFIGURATION
+      # Use your REAL IP (e.g., 192.168.178.50), not localhost!
+      - GROCY_URL=http://192.168.178.50:9283/api
+      - GROCY_API_KEY=DEIN_API_KEY_HIER_EINFÜGEN
+
+      # TESSERACT (Matches your Dockerfile path)
+      - TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+
+      # UPLOAD LIMITS (Important for phone camera images)
+      - SPRING_SERVLET_MULTIPART_MAX_FILE_SIZE=20MB
+      - SPRING_SERVLET_MULTIPART_MAX_REQUEST_SIZE=20MB
+
+  # --- FRONTEND SERVICE ---
+  frontend:
+    build: ./grocy-receipt-scanner-fe
+    container_name: scanner-frontend
+    restart: always
+    ports:
+      - "4200:80" # Maps local port 4200 to container port 80 (Nginx)
+    depends_on:
+      - backend
